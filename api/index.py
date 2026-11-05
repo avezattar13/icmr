@@ -19,14 +19,26 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-# Updated to the new dataset repo
 REPO_ID = "avezattar/1CMR-compact" 
 HF_TOKEN = os.getenv("hf_token") 
 
 global_fs = HfFileSystem(token=HF_TOKEN)
 
-# --- Exact file paths matching your screenshot ---
-FILE_LIST = [f"datasets/{REPO_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
+# --- File List ---
+# NOTE: If you followed the chunking advice from the previous message, 
+# your files are now named like 'icmr_part01_chunk000.parquet'.
+# Since chunk counts vary, we dynamically list the directory once, 
+# but we do it at import time so Vercel caches the result.
+# If you haven't chunked them yet, this will just list the 4 big files.
+try:
+    # We use a broader glob here just in case you chunk them later
+    FILE_LIST = global_fs.glob(f"datasets/{REPO_ID}/*.parquet")
+    # Filter out the .gitattributes or other non-parquet files just to be safe
+    FILE_LIST = [f for f in FILE_LIST if f.endswith('.parquet')]
+except Exception as e:
+    # Fallback if glob fails (e.g., network issue at cold start)
+    print(f"Error globbing files: {e}")
+    FILE_LIST = [f"datasets/{REPO_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
 
 @app.get("/")
 def root():
@@ -43,14 +55,33 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
                 media_type="application/json"
             )
 
+        if not FILE_LIST:
+            return Response(
+                content=json.dumps({"error": "Dataset files not found or failed to load."}, indent=4), 
+                media_type="application/json"
+            )
+
         # Load the dataset
         dataset = ds.dataset(FILE_LIST, filesystem=global_fs, format="parquet")
         
-        # Filter for the exact phone number column
+        # Only read the columns we actually need for the response to save memory
+        columns_to_read = [
+            "name", "fathersName", "phoneNumber", "otherNumber",
+            "passportNumber", "aadharNumber", "age", "gender",
+            "address", "district", "pincode", "state", "town"
+        ]
+        
         filter_expr = pc.equal(pc.field("phoneNumber"), mobile)
         
         # use_threads=False prevents Vercel 1GB RAM OOM crash
-        table = dataset.scanner(filter=filter_expr, use_threads=False).head(5) 
+        # pre_buffer=False reduces memory overhead during read
+        table = dataset.scanner(
+            filter=filter_expr,
+            columns=columns_to_read,
+            use_threads=False,
+            pre_buffer=False
+        ).head(5)
+        
         raw_records = table.to_pylist()
         
         elapsed = time.time() - start_time
