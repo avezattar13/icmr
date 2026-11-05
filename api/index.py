@@ -25,19 +25,12 @@ HF_TOKEN = os.getenv("hf_token")
 global_fs = HfFileSystem(token=HF_TOKEN)
 
 # --- File List ---
-# NOTE: If you followed the chunking advice from the previous message, 
-# your files are now named like 'icmr_part01_chunk000.parquet'.
-# Since chunk counts vary, we dynamically list the directory once, 
-# but we do it at import time so Vercel caches the result.
-# If you haven't chunked them yet, this will just list the 4 big files.
 try:
-    # We use a broader glob here just in case you chunk them later
     FILE_LIST = global_fs.glob(f"datasets/{REPO_ID}/*.parquet")
-    # Filter out the .gitattributes or other non-parquet files just to be safe
     FILE_LIST = [f for f in FILE_LIST if f.endswith('.parquet')]
 except Exception as e:
-    # Fallback if glob fails (e.g., network issue at cold start)
     print(f"Error globbing files: {e}")
+    # Fallback if glob fails during cold start
     FILE_LIST = [f"datasets/{REPO_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
 
 @app.get("/")
@@ -61,10 +54,9 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
                 media_type="application/json"
             )
 
-        # Load the dataset
         dataset = ds.dataset(FILE_LIST, filesystem=global_fs, format="parquet")
         
-        # Only read the columns we actually need for the response to save memory
+        # Explicitly limit columns to save RAM
         columns_to_read = [
             "name", "fathersName", "phoneNumber", "otherNumber",
             "passportNumber", "aadharNumber", "age", "gender",
@@ -73,13 +65,12 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
         
         filter_expr = pc.equal(pc.field("phoneNumber"), mobile)
         
-        # use_threads=False prevents Vercel 1GB RAM OOM crash
-        # pre_buffer=False reduces memory overhead during read
+        # Removed 'pre_buffer' — not supported in this pyarrow build.
+        # use_threads=False remains to prevent OOM.
         table = dataset.scanner(
             filter=filter_expr,
             columns=columns_to_read,
-            use_threads=False,
-            pre_buffer=False
+            use_threads=False
         ).head(5)
         
         raw_records = table.to_pylist()
@@ -104,7 +95,6 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
             )
             
         for i, row in enumerate(raw_records, 1):
-            # Mapping every column exactly as it appears in the 1CMR screenshots
             clean_row = {}
             if row.get("name"): clean_row["name"] = row["name"]
             if row.get("fathersName"): clean_row["father_name"] = row["fathersName"]
