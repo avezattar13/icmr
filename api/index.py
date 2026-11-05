@@ -7,6 +7,7 @@ from huggingface_hub import HfFileSystem
 import os
 import time
 import json
+import traceback
 
 app = FastAPI(title="1CMR-API")
 
@@ -24,14 +25,8 @@ HF_TOKEN = os.getenv("hf_token")
 
 global_fs = HfFileSystem(token=HF_TOKEN)
 
-# --- File List ---
-try:
-    FILE_LIST = global_fs.glob(f"datasets/{REPO_ID}/*.parquet")
-    FILE_LIST = [f for f in FILE_LIST if f.endswith('.parquet')]
-except Exception as e:
-    print(f"Error globbing files: {e}")
-    # Fallback if glob fails during cold start
-    FILE_LIST = [f"datasets/{REPO_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
+# Pre-defined list for the 1CMR files
+FILE_LIST = [f"datasets/{REPO_ID}/icmr_part0{i}.parquet" for i in range(1, 5)]
 
 @app.get("/")
 def root():
@@ -48,15 +43,10 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
                 media_type="application/json"
             )
 
-        if not FILE_LIST:
-            return Response(
-                content=json.dumps({"error": "Dataset files not found or failed to load."}, indent=4), 
-                media_type="application/json"
-            )
-
+        # Load dataset
         dataset = ds.dataset(FILE_LIST, filesystem=global_fs, format="parquet")
         
-        # Explicitly limit columns to save RAM
+        # Only read the columns we need
         columns_to_read = [
             "name", "fathersName", "phoneNumber", "otherNumber",
             "passportNumber", "aadharNumber", "age", "gender",
@@ -65,16 +55,22 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
         
         filter_expr = pc.equal(pc.field("phoneNumber"), mobile)
         
-        # Removed 'pre_buffer' — not supported in this pyarrow build.
-        # use_threads=False remains to prevent OOM.
-        table = dataset.scanner(
+        # --- MEMORY FIX: Iterate in small batches ---
+        # This prevents PyArrow from trying to buffer huge row groups
+        scanner = dataset.scanner(
             filter=filter_expr,
             columns=columns_to_read,
-            use_threads=False
-        ).head(5)
+            use_threads=False,
+            batch_size=1024  # Force small reads
+        )
         
-        raw_records = table.to_pylist()
-        
+        raw_records = []
+        # Iterate through batches. Break as soon as we find a match.
+        for batch in scanner.to_batches():
+            if batch.num_rows > 0:
+                raw_records = batch.to_pylist()
+                break
+                
         elapsed = time.time() - start_time
         
         response_data = {
@@ -119,7 +115,9 @@ def search(mobile: str = Query(..., description="10-digit mobile number")):
         )
         
     except Exception as e:
+        error_trace = traceback.format_exc()
+        print(f"CRITICAL ERROR:\n{error_trace}")
         return Response(
-            content=json.dumps({"error": str(e)}, indent=4), 
+            content=json.dumps({"error": f"Search failed: {str(e)}"}, indent=4), 
             media_type="application/json"
         )
